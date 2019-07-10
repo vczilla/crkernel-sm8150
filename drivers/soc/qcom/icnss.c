@@ -3397,6 +3397,8 @@ static int icnss_remove(struct platform_device *pdev)
 
 	icnss_sysfs_destroy(penv);
 
+	icnss_sysfs_destroy(penv);
+
 	complete_all(&penv->unblock_shutdown);
 
 	icnss_modem_ssr_unregister_notifier(penv);

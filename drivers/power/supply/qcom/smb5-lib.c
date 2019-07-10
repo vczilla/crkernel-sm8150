@@ -1231,9 +1231,6 @@ static void smblib_uusb_removal(struct smb_charger *chg)
 
 	cancel_delayed_work_sync(&chg->pl_enable_work);
 
-	if (chg->wa_flags & CHG_TERMINATION_WA)
-		alarm_cancel(&chg->chg_termination_alarm);
-
 	if (chg->wa_flags & BOOST_BACK_WA) {
 		data = chg->irq_info[SWITCHER_POWER_OK_IRQ].irq_data;
 		if (data) {
@@ -1590,6 +1587,29 @@ int smblib_toggle_smb_en(struct smb_charger *chg, int toggle)
 
 	rc = smblib_select_sec_charger(chg, chg->sec_chg_selected,
 				chg->cp_reason, true);
+
+	return rc;
+}
+
+int smblib_get_irq_status(struct smb_charger *chg,
+				union power_supply_propval *val)
+{
+	int rc;
+	u8 reg;
+
+	mutex_lock(&chg->irq_status_lock);
+	/* Report and clear cached status */
+	val->intval = chg->irq_status;
+	chg->irq_status = 0;
+
+	/* get real time status of pulse skip irq */
+	rc = smblib_read(chg, MISC_PBS_RT_STS_REG, &reg);
+	if (rc < 0)
+		smblib_err(chg, "Couldn't read MISC_PBS_RT_STS_REG rc=%d\n",
+				rc);
+	else
+		val->intval |= (reg & PULSE_SKIP_IRQ_BIT);
+	mutex_unlock(&chg->irq_status_lock);
 
 	return rc;
 }
@@ -3328,11 +3348,6 @@ int smblib_get_prop_usb_online(struct smb_charger *chg,
 		val->intval = true;
 		return rc;
 	}
-	chg->dash_on = get_prop_fast_chg_started(chg);
-	if (chg->dash_on) {
-		val->intval = true;
-		return rc;
-	}
 	if (is_client_vote_enabled(chg->usb_icl_votable,
 					CHG_TERMINATION_VOTER)) {
 		rc = smblib_get_prop_usb_present(chg, val);
@@ -4069,12 +4084,16 @@ static int get_rp_based_dcp_current(struct smb_charger *chg, int typec_mode)
 int smblib_set_prop_pd_current_max(struct smb_charger *chg,
 				    const union power_supply_propval *val)
 {
-	int rc;
+	int rc, icl;
 
-	if (chg->pd_active)
+	if (chg->pd_active) {
+		icl = get_client_vote(chg->usb_icl_votable, PD_VOTER);
 		rc = vote(chg->usb_icl_votable, PD_VOTER, true, val->intval);
-	else
+		if (val->intval != icl)
+			power_supply_changed(chg->usb_psy);
+	} else {
 		rc = -EPERM;
+	}
 
 	/* add to set pd charging current 2.0A when panel on */
 	if (chg->oem_lcd_is_on)
@@ -4677,6 +4696,21 @@ irqreturn_t default_irq_handler(int irq, void *data)
 	return IRQ_HANDLED;
 }
 
+irqreturn_t sdam_sts_change_irq_handler(int irq, void *data)
+{
+	struct smb_irq_data *irq_data = data;
+	struct smb_charger *chg = irq_data->parent_data;
+
+	smblib_dbg(chg, PR_INTERRUPT, "IRQ: %s\n", irq_data->name);
+
+	mutex_lock(&chg->irq_status_lock);
+	chg->irq_status |= PULSE_SKIP_IRQ_BIT;
+	mutex_unlock(&chg->irq_status_lock);
+
+	power_supply_changed(chg->usb_main_psy);
+	return IRQ_HANDLED;
+}
+
 #define CHG_TERM_WA_ENTRY_DELAY_MS		300000		/* 5 min */
 #define CHG_TERM_WA_EXIT_DELAY_MS		60000		/* 1 min */
 static void smblib_eval_chg_termination(struct smb_charger *chg, u8 batt_status)
@@ -4684,7 +4718,8 @@ static void smblib_eval_chg_termination(struct smb_charger *chg, u8 batt_status)
 	union power_supply_propval pval = {0, };
 	int rc = 0;
 
-	rc = smblib_get_prop_from_bms(chg, POWER_SUPPLY_PROP_CAPACITY, &pval);
+	rc = smblib_get_prop_from_bms(chg,
+				POWER_SUPPLY_PROP_REAL_CAPACITY, &pval);
 	if (rc < 0) {
 		smblib_err(chg, "Couldn't read SOC value, rc=%d\n", rc);
 		return;
@@ -4698,6 +4733,8 @@ static void smblib_eval_chg_termination(struct smb_charger *chg, u8 batt_status)
 	 * to prevent overcharing.
 	 */
 	if ((batt_status == TERMINATE_CHARGE) && (pval.intval == 100)) {
+		chg->cc_soc_ref = 0;
+		chg->last_cc_soc = 0;
 		alarm_start_relative(&chg->chg_termination_alarm,
 				ms_to_ktime(CHG_TERM_WA_ENTRY_DELAY_MS));
 	} else if (pval.intval < 100) {
@@ -4706,6 +4743,7 @@ static void smblib_eval_chg_termination(struct smb_charger *chg, u8 batt_status)
 		 * we exit the TERMINATE_CHARGE state and soc drops below 100%
 		 */
 		chg->cc_soc_ref = 0;
+		chg->last_cc_soc = 0;
 	}
 }
 
@@ -5765,9 +5803,6 @@ static void typec_src_removal(struct smb_charger *chg)
 
 	cancel_delayed_work_sync(&chg->pl_enable_work);
 
-	if (chg->wa_flags & CHG_TERMINATION_WA)
-		alarm_cancel(&chg->chg_termination_alarm);
-
 	/* reset input current limit voters */
 	vote(chg->usb_icl_votable, SW_ICL_MAX_VOTER, true, 500000);
 	vote(chg->usb_icl_votable, PD_VOTER, false, 0);
@@ -6361,7 +6396,7 @@ static void op_get_aicl_work(struct work_struct *work)
 
 #define NORMAL_CHECK_INTERVAL 300 /*ms*/
 #define FAST_CHECK_INTERVAL 100 /*ms*/
-#define HIGH_TEMP_SHORT_CHECK_TIMEOUT 1500 /*ms*/
+#define HIGH_TEMP_SHORT_CHECK_TIMEOUT 1000 /*ms*/
 
 static void op_connect_temp_check_work(struct work_struct *work)
 {
@@ -6436,8 +6471,9 @@ static void op_connect_temp_check_work(struct work_struct *work)
 					chg->connecter_temp);
 			op_disconnect_vbus(chg, true);
 			return;
-		} else if (chg->connecter_temp >= 35) {
-		/* >= 35 enter*/
+		} else if (((interval_temp >= 10) && (interval_temp < 15)) &&
+					(chg->connecter_temp >= 45)) {
+		/* 10<= <15*/
 			if (chg->count_run <= chg->count_total) {
 			/*time out count*/
 				if (chg->count_run == 0)
@@ -6447,14 +6483,8 @@ static void op_connect_temp_check_work(struct work_struct *work)
 				if (chg->count_run > 0) {
 					chg->current_temp = chg->connecter_temp;
 					if ((chg->current_temp - chg->pre_temp)
-						>= 3) {
+						>= 3)
 						chg->connector_short = true;
-						pr_info("cout_run=%d,short=%d\n",
-							chg->count_run,
-							chg->connector_short);
-						op_disconnect_vbus(chg, true);
-						return;
-					}
 				}
 
 				chg->count_run++;/*count ++*/
@@ -7272,10 +7302,8 @@ static int set_dash_charger_present(int status)
 			vote(g_chg->usb_icl_votable, PD_VOTER, true,
 					DEFAULT_WALL_CHG_MA * 1000);
 		}
-		if (g_chg->dash_present) {
-			g_chg->real_charger_type = POWER_SUPPLY_TYPE_DASH;
+		if (g_chg->dash_present)
 			g_chg->usb_psy_desc.type = POWER_SUPPLY_TYPE_DASH;
-		}
 		power_supply_changed(g_chg->batt_psy);
 		pr_info("dash_present = %d, charger_present = %d\n",
 				g_chg->dash_present, charger_present);
@@ -8055,35 +8083,6 @@ static void op_check_charger_uovp(struct smb_charger *chg, int vchg_mv)
 	pre_uovp_satus = uovp_satus;
 }
 
-static void op_dcdc_vph_track_sel(struct smb_charger *chg)
-{
-	int rc = 0;
-
-	pr_debug("lcd_is_on:%d\n", chg->oem_lcd_is_on);
-
-	if (chg->vbus_present && chg->chg_done && !chg->vph_sel_disable) {
-		if (chg->oem_lcd_is_on && !chg->vph_set_flag) {
-			pr_info("vbus present,LCD on set dcdc vph 300mv\n");
-			/* config the DCDC_VPH_TRACK_SEL 300mv */
-			rc = smblib_masked_write(chg, DCDC_VPH_TRACK_SEL,
-					VPH_TRACK_SEL_MASK, SEL_300MV);
-			if (rc < 0)
-				pr_err("Couldn't set  DCDC_VPH_TRACK_SEL rc=%d\n",
-						rc);
-			chg->vph_set_flag = true;
-		} else if (!chg->oem_lcd_is_on && chg->vph_set_flag) {
-			pr_info("vbus present,LCD off set dcdc vph 100mv\n");
-			/* config the DCDC_VPH_TRACK_SEL 100mv */
-			rc = smblib_masked_write(chg, DCDC_VPH_TRACK_SEL,
-					VPH_TRACK_SEL_MASK, 0);
-			if (rc < 0)
-				pr_err("Couldn't set  DCDC_VPH_TRACK_SEL rc=%d\n",
-						rc);
-			chg->vph_set_flag = false;
-		}
-	}
-}
-
 #if defined(CONFIG_FB)
 static int fb_notifier_callback(struct notifier_block *self,
 		unsigned long event, void *data)
@@ -8138,13 +8137,11 @@ static int msm_drm_notifier_callback(struct notifier_block *self,
 				set_property_on_fg(chip,
 				POWER_SUPPLY_PROP_UPDATE_LCD_IS_OFF, 0);
 			chip->oem_lcd_is_on = true;
-			op_dcdc_vph_track_sel(chip);
 		} else if (*blank == MSM_DRM_BLANK_POWERDOWN) {
 			if (chip->oem_lcd_is_on != false)
 				set_property_on_fg(chip,
 				POWER_SUPPLY_PROP_UPDATE_LCD_IS_OFF, 1);
 			chip->oem_lcd_is_on = false;
-			op_dcdc_vph_track_sel(chip);
 		}
 		/* add to set pd charging current 2.0A when panel on */
 		if (typec_mode == POWER_SUPPLY_TYPEC_SOURCE_HIGH) {
@@ -8265,7 +8262,6 @@ static bool op_check_vbat_is_full_by_sw(struct smb_charger *chg)
 	static int vbat_counts_hw;
 	int vbatt_full_vol_sw;
 	int vbatt_full_vol_hw;
-	int term_current;
 	int tbatt_status, icharging, batt_volt;
 
 	if (!chg->check_batt_full_by_sw)
@@ -8301,17 +8297,12 @@ static bool op_check_vbat_is_full_by_sw(struct smb_charger *chg)
 		ret_hw = 0;
 		return false;
 	}
-	if (chg->little_cold_iterm_ma > 0
-		&& (tbatt_status == BATT_TEMP_LITTLE_COLD))
-		term_current = chg->little_cold_iterm_ma;
-	else
-		term_current =  chg->sw_iterm_ma;
 
 	batt_volt = get_prop_batt_voltage_now(chg) / 1000;
 	icharging = get_prop_batt_current_now(chg) / 1000;
 	/* use SW Vfloat to check */
 	if (batt_volt > vbatt_full_vol_sw) {
-		if (icharging < 0 && (icharging * -1) <= term_current) {
+		if (icharging < 0 && (icharging * -1) <= chg->sw_iterm_ma) {
 			vbat_counts_sw++;
 			if (vbat_counts_sw > FULL_COUNTS_SW) {
 				vbat_counts_sw = 0;
@@ -8365,7 +8356,6 @@ void checkout_term_current(struct smb_charger *chg)
 	if (chg_full) {
 		chg->chg_done = true;
 		op_charging_en(chg, false);
-		op_dcdc_vph_track_sel(chg);
 		pr_info("chg_done:CAP=%d (Q:%d),VBAT=%d (Q:%d),IBAT=%d (Q:%d),BAT_TEMP=%d\n",
 				get_prop_batt_capacity(chg),
 				get_prop_fg_capacity(chg),
@@ -9465,9 +9455,11 @@ static void smblib_chg_termination_work(struct work_struct *work)
 	if ((rc < 0) || !input_present)
 		goto out;
 
-	rc = smblib_get_prop_from_bms(chg, POWER_SUPPLY_PROP_CAPACITY, &pval);
+	rc = smblib_get_prop_from_bms(chg,
+				POWER_SUPPLY_PROP_REAL_CAPACITY, &pval);
 	if ((rc < 0) || (pval.intval < 100)) {
 		vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, false, 0);
+		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, false, 0);
 		goto out;
 	}
 
@@ -9498,6 +9490,18 @@ static void smblib_chg_termination_work(struct work_struct *work)
 	}
 
 	/*
+	 * In BSM a sudden jump in CC_SOC is not expected. If seen, its a
+	 * good_ocv or updated capacity, reject it.
+	 */
+	if (chg->last_cc_soc && pval.intval > (chg->last_cc_soc + 100)) {
+		/* CC_SOC has increased by 1% from last time */
+		chg->cc_soc_ref = pval.intval;
+		smblib_dbg(chg, PR_MISC, "cc_soc jumped(%d->%d), reset cc_soc_ref\n",
+				chg->last_cc_soc, pval.intval);
+	}
+	chg->last_cc_soc = pval.intval;
+
+	/*
 	 * Suspend/Unsuspend USB input to keep cc_soc within the 0.5% to 0.75%
 	 * overshoot range of the cc_soc value at termination, to prevent
 	 * overcharging.
@@ -9508,8 +9512,12 @@ static void smblib_chg_termination_work(struct work_struct *work)
 		delay = CHG_TERM_WA_ENTRY_DELAY_MS;
 	} else if (pval.intval > DIV_ROUND_CLOSEST(chg->cc_soc_ref * 10075,
 								10000)) {
-		vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER, true, 0);
-		vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER, true, 0);
+		if (input_present & INPUT_PRESENT_USB)
+			vote(chg->usb_icl_votable, CHG_TERMINATION_VOTER,
+					true, 0);
+		if (input_present & INPUT_PRESENT_DC)
+			vote(chg->dc_suspend_votable, CHG_TERMINATION_VOTER,
+					true, 0);
 		delay = CHG_TERM_WA_EXIT_DELAY_MS;
 	}
 
@@ -9937,6 +9945,7 @@ int smblib_init(struct smb_charger *chg)
 	mutex_init(&chg->smb_lock);
 	mutex_init(&chg->write_lock);
 	mutex_init(&chg->sw_dash_lock);
+	mutex_init(&chg->irq_status_lock);
 	INIT_WORK(&chg->bms_update_work, bms_update_work);
 	INIT_WORK(&chg->pl_update_work, pl_update_work);
 	INIT_WORK(&chg->jeita_update_work, jeita_update_work);

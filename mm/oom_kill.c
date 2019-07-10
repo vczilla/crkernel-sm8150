@@ -861,6 +861,13 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 	 * still freeing memory.
 	 */
 	read_lock(&tasklist_lock);
+
+	/*
+	 * The task 'p' might have already exited before reaching here. The
+	 * put_task_struct() will free task_struct 'p' while the loop still try
+	 * to access the field of 'p', so, get an extra reference.
+	 */
+	get_task_struct(p);
 	for_each_thread(p, t) {
 		list_for_each_entry(child, &t->children, sibling) {
 			unsigned int child_points;
@@ -880,6 +887,7 @@ static void oom_kill_process(struct oom_control *oc, const char *message)
 			}
 		}
 	}
+	put_task_struct(p);
 	read_unlock(&tasklist_lock);
 
 	p = find_lock_task_mm(victim);
@@ -1094,6 +1102,9 @@ void pagefault_out_of_memory(void)
 		.gfp_mask = 0,
 		.order = 0,
 	};
+
+	if (IS_ENABLED(CONFIG_HAVE_LOW_MEMORY_KILLER))
+		return;
 
 	if (mem_cgroup_oom_synchronize(true))
 		return;

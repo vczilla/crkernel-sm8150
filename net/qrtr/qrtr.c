@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2015, Sony Mobile Communications Inc.
- * Copyright (c) 2013, 2018 The Linux Foundation. All rights reserved.
+ * Copyright (c) 2013, 2018-2019 The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -23,6 +23,7 @@
 #include <linux/pm_wakeup.h>
 
 #include <net/sock.h>
+#include <uapi/linux/sched/types.h>
 
 #include "qrtr.h"
 
@@ -514,8 +515,10 @@ static int qrtr_node_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 	size_t len = skb->len;
 	int rc = -ENODEV;
 
-	if (!atomic_read(&node->hello_sent) && type != QRTR_TYPE_HELLO)
+	if (!atomic_read(&node->hello_sent) && type != QRTR_TYPE_HELLO) {
+		kfree_skb(skb);
 		return rc;
+	}
 
 	/* If sk is null, this is a forwarded packet and should not wait */
 	if (!skb->sk) {
@@ -750,6 +753,8 @@ int qrtr_endpoint_post(struct qrtr_endpoint *ep, const void *data, size_t len)
 	    cb->type != QRTR_TYPE_RESUME_TX)
 		goto err;
 
+	__pm_wakeup_event(node->ws, 0);
+
 	skb_put_data(skb, data + hdrlen, size);
 
 	if (node->ws && node->nid == 0)
@@ -941,13 +946,16 @@ static void qrtr_node_rx_work(struct kthread_work *work)
  * qrtr_endpoint_register() - register a new endpoint
  * @ep: endpoint to register
  * @nid: desired node id; may be QRTR_EP_NID_AUTO for auto-assignment
+ * @rt: flag to notify real time low latency endpoint
  * Return: 0 on success; negative error code on failure
  *
  * The specified endpoint must have the xmit function pointer set on call.
  */
-int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int net_id)
+int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int net_id,
+			   bool rt)
 {
 	struct qrtr_node *node;
+	struct sched_param param = {.sched_priority = 1};
 
 	if (!ep || !ep->xmit)
 		return -EINVAL;
@@ -970,6 +978,8 @@ int qrtr_endpoint_register(struct qrtr_endpoint *ep, unsigned int net_id)
 		kfree(node);
 		return -ENOMEM;
 	}
+	if (rt)
+		sched_setscheduler(node->task, SCHED_FIFO, &param);
 
 	mutex_init(&node->qrtr_tx_lock);
 	INIT_RADIX_TREE(&node->qrtr_tx_flow, GFP_KERNEL);

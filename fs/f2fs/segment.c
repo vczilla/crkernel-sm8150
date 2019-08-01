@@ -2974,7 +2974,7 @@ void f2fs_wait_on_block_writeback(struct f2fs_sb_info *sbi, block_t blkaddr)
 	}
 }
 
-static void read_compacted_summaries(struct f2fs_sb_info *sbi)
+static int read_compacted_summaries(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
 	struct curseg_info *seg_i;
@@ -2986,6 +2986,8 @@ static void read_compacted_summaries(struct f2fs_sb_info *sbi)
 	start = start_sum_block(sbi);
 
 	page = get_meta_page(sbi, start++);
+	if (IS_ERR(page))
+		return PTR_ERR(page);
 	kaddr = (unsigned char *)page_address(page);
 
 	/* Step 1: restore nat cache */
@@ -3005,6 +3007,11 @@ static void read_compacted_summaries(struct f2fs_sb_info *sbi)
 		seg_i = CURSEG_I(sbi, i);
 		segno = le32_to_cpu(ckpt->cur_data_segno[i]);
 		blk_off = le16_to_cpu(ckpt->cur_data_blkoff[i]);
+		if (blk_off > ENTRIES_IN_SUM) {
+			f2fs_bug_on(sbi, 1);
+			f2fs_put_page(page, 1);
+			return -EFAULT;
+		}
 		seg_i->next_segno = segno;
 		reset_curseg(sbi, i, 0);
 		seg_i->alloc_type = ckpt->alloc_type[i];
@@ -3026,13 +3033,15 @@ static void read_compacted_summaries(struct f2fs_sb_info *sbi)
 			page = NULL;
 
 			page = get_meta_page(sbi, start++);
+			if (IS_ERR(page))
+				return PTR_ERR(page);
 			kaddr = (unsigned char *)page_address(page);
 			offset = 0;
 		}
 	}
 	f2fs_put_page(page, 1);
+	return 0;
 }
-
 static int read_normal_summaries(struct f2fs_sb_info *sbi, int type)
 {
 	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);

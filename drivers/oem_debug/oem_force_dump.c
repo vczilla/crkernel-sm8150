@@ -139,7 +139,7 @@ static void send_msg_worker(struct work_struct *work)
 		send_msg("Enable DEBUG!");
 	else if (message_state == 2) {
 		pr_info("force oem serial\n");
-		msm_serial_oem_init();
+//		msm_serial_oem_init();
 		send_msg("ENABLE_OEM_FORCE_SERIAL");
 	}
 	message_state = 0;
